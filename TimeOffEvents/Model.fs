@@ -4,6 +4,15 @@ open System
 open EventStorage
 open System.Reflection
 
+type Balance = {
+    UserName: string
+    BalanceYear: int
+    PortionAccruedToDate: float
+    TakenToDate: float
+    Planned: float
+    CurrentBalance: float
+}
+
 type User =
     | Employee of int
     | Manager
@@ -148,7 +157,11 @@ module Logic =
         | _ -> Error "Request cannot be asked for cancellation"
 
     // manager refuses a cancellation of validated request
-
+    let refuseRequestCancellation requestState =
+        match requestState with
+        | AskedForCancellation request ->
+            Ok [RequestCancellationRefused request]
+        | _ -> Error "Request cancellation cannot be refused"
 
     // employee cancels his requests (pending or validated) if it starts in the future
     let cancelRequestByEmployee requestState =
@@ -157,10 +170,15 @@ module Logic =
             if request.Start.Date > DateTime.Today then
                 Ok [RequestCanceledByEmployee request]
             else
-                Error "Request cannot be canceled"
-        | _ -> Error "Request cannot be canceled"
+                Error "Request cannot be canceled by the employee"
+        | _ -> Error "Request cannot be canceled by the employee"
 
     // manager cancels a request in any state : pending, validated, asked for cancellation, refused to cancel
+    let cancelRequestByManager requestState =
+        match requestState with
+        | PendingValidation request | Validated request | AskedForCancellation request | CancellationRefused request ->
+            Ok [RequestCanceledByManager request]
+        | _ -> Error "Request cannot be canceled by the manager"
 
     let handleCommand (store: IStore<UserId, RequestEvent>) (command: Command) =
         let userId = command.UserId
@@ -182,3 +200,63 @@ module Logic =
         | ValidateRequest (_, requestId) ->
             let requestState = defaultArg (userRequests.TryFind requestId) NotCreated
             validateRequest requestState
+        
+        | RefuseRequest (_, requestId) ->
+            let requestState = defaultArg (userRequests.TryFind requestId) NotCreated
+            refuseRequest requestState
+        
+        | AskForCancellation (_, requestId) ->
+            let requestState = defaultArg (userRequests.TryFind requestId) NotCreated
+            askForCancellation requestState
+
+        | RefuseCancellation (_, requestId) ->
+            let requestState = defaultArg (userRequests.TryFind requestId) NotCreated
+            refuseRequestCancellation requestState
+
+        | CancelByEmployee (_, requestId) ->
+            let requestState = defaultArg (userRequests.TryFind requestId) NotCreated
+            cancelRequestByEmployee requestState
+
+        | CancelByManager (_, requestId) ->
+            let requestState = defaultArg (userRequests.TryFind requestId) NotCreated
+            cancelRequestByManager requestState
+
+    let computeTimeOff request =
+        let time = request.End.Date - request.Start.Date
+        let mutable result = time.TotalDays
+        if request.End.HalfDay.Equals AM then do
+            result <- result - 0.5
+        if request.Start.HalfDay.Equals PM then do
+            result <- result - 0.5
+        result
+
+    // Get balance of day off
+    let getBalance (store: IStore<UserId, RequestEvent>) userId =
+        let stream = store.GetStream userId
+        let events = stream.ReadAll()
+        let userRequests = getAllRequests events
+        let activeRequests =
+            userRequests
+            |> Map.toSeq
+            |> Seq.map (fun (_, state) -> state)
+            |> Seq.where (fun state -> state.IsActive)
+            |> Seq.map (fun state -> state.Request)
+        
+        let accrued = (25. / 12.) * float (DateTime.Today.Month - 1)
+
+        let taken =
+            Seq.sumBy computeTimeOff (activeRequests
+            |> Seq.where (fun (request) -> request.Start.Date <= DateTime.Today))
+        
+        let planned =
+            Seq.sumBy computeTimeOff (activeRequests
+            |> Seq.where (fun (request) -> request.Start.Date > DateTime.Today))
+
+        {
+            UserName = "userToDisplay"
+            BalanceYear = DateTime.Today.Year
+            PortionAccruedToDate = accrued
+            TakenToDate = taken
+            Planned = planned
+            CurrentBalance = accrued - (taken + planned)
+        }

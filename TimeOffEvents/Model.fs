@@ -41,6 +41,7 @@ type Command =
     | RefuseCancellation of UserId * Guid
     | CancelByEmployee of UserId * Guid
     | CancelByManager of UserId * Guid
+    | Balance of UserId
     with
     member this.UserId =
         match this with
@@ -51,6 +52,7 @@ type Command =
         | RefuseCancellation (userId, _) -> userId
         | CancelByEmployee (userId, _) -> userId
         | CancelByManager (userId, _) -> userId
+        | Balance (userId) -> userId
 
 type RequestEvent =
     | RequestCreated of TimeOffRequest
@@ -60,6 +62,7 @@ type RequestEvent =
     | RequestCancellationRefused of TimeOffRequest
     | RequestCanceledByEmployee of TimeOffRequest
     | RequestCanceledByManager of TimeOffRequest
+    | RequestBalance of Balance
     with
     member this.Request =
         match this with
@@ -70,6 +73,11 @@ type RequestEvent =
         | RequestCancellationRefused request -> request
         | RequestCanceledByEmployee request -> request
         | RequestCanceledByManager request -> request
+        | RequestBalance _ -> invalidOp "balance"
+    member this.Balance =
+        match this with
+        | RequestBalance balance -> balance
+        | _ -> invalidOp "request"
 
 module Logic =
 
@@ -108,6 +116,7 @@ module Logic =
         | RequestCancellationRefused request -> CancellationRefused request
         | RequestCanceledByEmployee _ -> CanceledByEmployee
         | RequestCanceledByManager _ -> CanceledByManager
+        | RequestBalance _ -> invalidOp "balance"
 
     let getRequestState events =
         events |> Seq.fold evolve NotCreated
@@ -137,14 +146,14 @@ module Logic =
         match requestState with
         | PendingValidation request ->
             Ok [RequestValidated request]
-        | _ -> Error "Request cannot be validated"
+        | _ -> Error "The request cannot be validated"
 
     // manager refuses a request
     let refuseRequest requestState =
         match requestState with
         | PendingValidation request ->
             Ok [RequestRefused request]
-        | _ -> Error "Request cannot be refused"
+        | _ -> Error "The request cannot be refused"
 
     // employee asks for cancellation of pending or validated request when it starts in the past or today
     let askForCancellation requestState =
@@ -153,15 +162,15 @@ module Logic =
             if request.Start.Date <= DateTime.Today then
                 Ok [RequestAskedForCancellation request]
             else
-                Error "Request cannot be asked for cancellation"
-        | _ -> Error "Request cannot be asked for cancellation"
+                Error "The request cannot be asked for cancellation"
+        | _ -> Error "The request cannot be asked for cancellation"
 
     // manager refuses a cancellation of validated request
     let refuseRequestCancellation requestState =
         match requestState with
         | AskedForCancellation request ->
             Ok [RequestCancellationRefused request]
-        | _ -> Error "Request cancellation cannot be refused"
+        | _ -> Error "The request cancellation cannot be refused"
 
     // employee cancels his requests (pending or validated) if it starts in the future
     let cancelRequestByEmployee requestState =
@@ -170,15 +179,56 @@ module Logic =
             if request.Start.Date > DateTime.Today then
                 Ok [RequestCanceledByEmployee request]
             else
-                Error "Request cannot be canceled by the employee"
-        | _ -> Error "Request cannot be canceled by the employee"
+                Error "The request cannot be canceled by the employee"
+        | _ -> Error "The request cannot be canceled by the employee"
 
     // manager cancels a request in any state : pending, validated, asked for cancellation, refused to cancel
     let cancelRequestByManager requestState =
         match requestState with
         | PendingValidation request | Validated request | AskedForCancellation request | CancellationRefused request ->
             Ok [RequestCanceledByManager request]
-        | _ -> Error "Request cannot be canceled by the manager"
+        | _ -> Error "The request cannot be canceled by the manager"
+    
+    // Compute the number of day off of the request
+    let computeTimeOff request =
+        let time = request.End.Date - request.Start.Date
+        let mutable result = time.TotalDays + 1.0
+        if request.End.HalfDay.Equals AM then do
+            result <- result - 0.5
+        if request.Start.HalfDay.Equals PM then do
+            result <- result - 0.5
+        result
+
+    // Get balance of day off
+    let getBalance (store: IStore<UserId, RequestEvent>) userId =
+        let stream = store.GetStream userId
+        let events = stream.ReadAll()
+        let userRequests = getAllRequests events
+        let activeRequests =
+            userRequests
+            |> Map.toSeq
+            |> Seq.map (fun (_, state) -> state)
+            |> Seq.where (fun state -> state.IsActive)
+            |> Seq.map (fun state -> state.Request)
+        
+        let accrued = (25. / 12.) * float (DateTime.Today.Month - 1)
+
+        let taken =
+            Seq.sumBy computeTimeOff (activeRequests
+            |> Seq.where (fun (request) -> request.Start.Date <= DateTime.Today))
+        
+        let planned =
+            Seq.sumBy computeTimeOff (activeRequests
+            |> Seq.where (fun (request) -> request.Start.Date > DateTime.Today))
+
+        {
+            UserName = "userToDisplay"
+            BalanceYear = DateTime.Today.Year
+            PortionAccruedToDate = accrued
+            TakenToDate = taken
+            Planned = planned
+            CurrentBalance = accrued - (taken + planned)
+        }
 
     let handleCommand (store: IStore<UserId, RequestEvent>) (command: Command) =
         let userId = command.UserId
@@ -220,43 +270,7 @@ module Logic =
         | CancelByManager (_, requestId) ->
             let requestState = defaultArg (userRequests.TryFind requestId) NotCreated
             cancelRequestByManager requestState
+        | Balance (userId) ->
+            let balance = getBalance store userId
+            Ok [RequestBalance balance]
 
-    let computeTimeOff request =
-        let time = request.End.Date - request.Start.Date
-        let mutable result = time.TotalDays
-        if request.End.HalfDay.Equals AM then do
-            result <- result - 0.5
-        if request.Start.HalfDay.Equals PM then do
-            result <- result - 0.5
-        result
-
-    // Get balance of day off
-    let getBalance (store: IStore<UserId, RequestEvent>) userId =
-        let stream = store.GetStream userId
-        let events = stream.ReadAll()
-        let userRequests = getAllRequests events
-        let activeRequests =
-            userRequests
-            |> Map.toSeq
-            |> Seq.map (fun (_, state) -> state)
-            |> Seq.where (fun state -> state.IsActive)
-            |> Seq.map (fun state -> state.Request)
-        
-        let accrued = (25. / 12.) * float (DateTime.Today.Month - 1)
-
-        let taken =
-            Seq.sumBy computeTimeOff (activeRequests
-            |> Seq.where (fun (request) -> request.Start.Date <= DateTime.Today))
-        
-        let planned =
-            Seq.sumBy computeTimeOff (activeRequests
-            |> Seq.where (fun (request) -> request.Start.Date > DateTime.Today))
-
-        {
-            UserName = "userToDisplay"
-            BalanceYear = DateTime.Today.Year
-            PortionAccruedToDate = accrued
-            TakenToDate = taken
-            Planned = planned
-            CurrentBalance = accrued - (taken + planned)
-        }

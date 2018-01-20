@@ -393,6 +393,38 @@ let balanceTests =
       |> When (Balance 1)
       |> Then (Ok [RequestBalance balance]) "The request balance should be equals"
     }
+
+    test "One future validated request and one past taken in store" {
+      let futureRequest = {
+        UserId = 1
+        RequestId = Guid.NewGuid()
+        Start = { Date = DateTime(2018, 12, 30); HalfDay = AM }
+        End = { Date = DateTime(2018, 12, 30); HalfDay = PM }
+      }
+      
+      let pastRequest = {
+          UserId = 1
+          RequestId = Guid.NewGuid()
+          Start = { Date = DateTime(2017, 12, 25); HalfDay = AM }
+          End = { Date = DateTime(2017, 12, 30); HalfDay = PM }
+      }
+
+      let balance: Balance = {
+        UserName = "userToDisplay"
+        BalanceYear = 2018
+        PortionAccruedToDate = 0.
+        TakenToDate = 6.
+        Planned = 1.
+        CurrentBalance = -7.
+      }
+
+      Given [
+        RequestValidated futureRequest
+        RequestValidated pastRequest
+      ]
+      |> When (Balance 1)
+      |> Then (Ok [RequestBalance balance]) "The request balance should be equals"
+    }
   ]
 
 let tests =
